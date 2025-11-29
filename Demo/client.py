@@ -1,98 +1,83 @@
 import socket
 import threading
-import sys
-import os
-import time
-# 引入之前写好的高级协议模块
-from protocol import HTLSProtocol
+import sys  # 用于获取命令行参数
+from crypto_utils import SecurityManager
+from protocol import SecureProtocol
+
+# 存储对方昵称（从第一条接收的消息中获取）
+peer_nickname = "对方"
 
 
-def receive_loop(proto, peer_name):
-    """
-    后台线程：接收消息
-    """
-    try:
-        while True:
-            msg = proto.recv_secure()
-            if not msg:
-                print(f"\n[!] {peer_name} 断开了连接。")
-                os._exit(0)
-            print(f"\n[{peer_name}]: {msg}")
-            print("我 (Client): ", end='', flush=True)
-    except Exception as e:
-        print(f"\n[!] 接收错误: {e}")
-        os._exit(1)
+def receive_messages(proto):
+    """实时接收服务器转发的消息（线程函数）"""
+    global peer_nickname  # 引用全局变量存储对方昵称
+    while True:
+        msg = proto.recv_decrypted()
+        if not msg:
+            print("\n[System] 与对方断开连接！")
+            break
 
-
-def get_connection(host, port, max_retries=10):
-    """
-    带重试机制的连接函数 (适配 Docker 启动慢的问题)
-    """
-    for i in range(max_retries):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((host, port))
-            return sock
-        except ConnectionRefusedError:
-            print(f"[*] 等待 Bob ({host}:{port}) 启动... ({i + 1}/{max_retries})")
-            time.sleep(2)
-        except Exception as e:
-            print(f"[!] 连接错误: {e}")
-            time.sleep(2)
-    return None
-
+        # 第一条消息是对方昵称，后续是聊天内容
+        if peer_nickname == "对方" and msg.startswith("[昵称]"):
+            peer_nickname = msg.replace("[昵称]", "").strip()
+            print(f"\n[System] 对方昵称已设置为：{peer_nickname}")
+            print("请输入消息：", end="", flush=True)
+        else:
+            print(f"\n[{peer_nickname}] {msg}")
+            print("请输入消息：", end="", flush=True)
 
 def main():
-
-    host = 'secure-server' if os.environ.get('DOCKER_ENV') else 'localhost'
+    host = 'localhost'
     port = 9999
 
-    # 获取连接
-    sock = get_connection(host, port)
-    if not sock:
-        print("[!] 无法连接到服务器。")
-        sys.exit(1)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((host, port))
+        print(f"已连接到转发服务器 ({host}:{port})")
+    except Exception as e:
+        print(f"连接失败: {e}")
+        return
 
-    print(f"[*] 已连接到 Bob ({host}:{port})")
-
-    # 初始化协议
-    proto = HTLSProtocol(sock)
+    sec = SecurityManager()
+    proto = SecureProtocol(sock, sec)
 
     try:
-        # --- 握手阶段 ---
-        print("[*] 正在初始化 H-TLS 协议...")
-        proto.handshake_as_client()
-        print("[*] 安全通道建立完毕！现在可以开始加密聊天了。")
-        print("[*] 输入 'exit' 退出。")
+        # --- 添加角色判断（发起方/响应方）---
+        is_initiator = "--init" in sys.argv  # 命令行带--init则为发起方
+        if is_initiator:
+            print("[System] 作为发起方，正在发起握手...")
+            proto.handshake_initiate()  # 发起方逻辑
+        else:
+            print("[System] 作为响应方，等待对方发起握手...")
+            if not proto.handshake_respond():  # 响应方逻辑
+                raise Exception("响应握手失败，请确保对方已启动")
 
-        # --- 通信阶段 ---
+        # --- 发送昵称（第一条消息）---
+        nickname = input("请输入你的昵称：").strip()
+        while not nickname:
+            nickname = input("昵称不能为空，请重新输入：").strip()
 
-        # 启动接收线程
-        recv_thread = threading.Thread(target=receive_loop, args=(proto, "Server"))
+        proto.send_encrypted(f"[昵称]{nickname}")
+        print(f"\n[System] 昵称设置成功：{nickname}（输入 exit 退出）")
+
+        # --- 启动接收消息线程 ---
+        recv_thread = threading.Thread(target=receive_messages, args=(proto,))
         recv_thread.daemon = True
         recv_thread.start()
 
-        # 主线程循环输入
         while True:
-            try:
-                msg = input("我 (Client): ")
-                if not msg: continue
-
-                if msg.lower() == 'exit':
-                    break
-
-                proto.send_secure(msg)
-
-            except EOFError:
+            text = input("请输入消息：").strip()
+            if not text:
+                continue
+            if text.lower() == "exit":
+                print("[System] 正在退出...")
                 break
-            except KeyboardInterrupt:
-                break
+            proto.send_encrypted(text)
 
     except Exception as e:
-        print(f"[!] 错误: {e}")
+        print(f"\n[Error] 发生异常: {e}")
     finally:
         sock.close()
-        print("[-] 客户端已退出")
 
 
 if __name__ == '__main__':
