@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  secure-server:
+    build: .
+    container_name: secure-server
+    command: python -u server.py
+    networks:
+      - htls-net
+    # 允许交互式输入
+    stdin_open: true 
+    tty: true
+
+  secure-client:
+    build: .
+    container_name: secure-client
+    command: python -u client.py
+    depends_on:
+      - secure-server
+    networks:
+      - htls-net
+    # 允许交互式输入
+    stdin_open: true
+    tty: true
+
+networks:
+  htls-net:
+    driver: bridge
