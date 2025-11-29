@@ -1,144 +1,134 @@
 import struct
-from crypto_base import CryptoBase
-from lattice_lwe import LWE_KEM
-from packet_layer import PacketLayer
+import json
+import socket
+import os
 
+# 消息类型定义
+MSG_HELLO = 0x01  # 握手开始
+MSG_KEY_EXCH = 0x02  # 交换临时公钥 + 签名
+MSG_FINISHED = 0x03  # 握手结束
+MSG_DATA = 0x04  # 加密聊天数据
+MSG_ERROR = 0xFF  # 错误消息
 
-class HTLSProtocol:
-    """
-    Hybrid-TLS Protocol Logic
-    State machine handling the handshake and secure record exchange.
-    """
+class SecureProtocol:
+    def __init__(self, socket_conn, crypto_manager):
+        self.sock = socket_conn
+        self.crypto = crypto_manager
+        self.buffer = b""
 
-    def __init__(self, sock):
-        self.net = PacketLayer(sock)
-        self.crypto = CryptoBase()
-        self.lwe = LWE_KEM()
-        self.session_key = None
-        self.peer_id = "Unknown"
+    def send_packet(self, msg_type, payload: bytes):
+        """发送协议数据包"""
+        length = len(payload)
+        # Header: 4 bytes length + 1 byte type
+        header = struct.pack("!IB", length, msg_type)
+        self.sock.sendall(header + payload)
 
-    def handshake_as_server(self):
-        print("[H-TLS] Server: Waiting for ClientHello...")
+    def receive_packet(self):
+        """接收完整的数据包"""
+        # 先读 Header (5 bytes)
+        header_data = self._recv_n(5)
+        if not header_data:
+            return None, None
 
-        # 1. Receive ClientHello
-        # Payload structure: [RSA_Pub_Len][RSA_Pub][ECDH_Pub_Len][ECDH_Pub][LWE_PK]
-        m_type, payload = self.net.recv_frame()
-        if m_type != PacketLayer.TYPE_HANDSHAKE: raise Exception("Expected Handshake")
+        length, msg_type = struct.unpack("!IB", header_data)
+        payload = self._recv_n(length)
+        return msg_type, payload
 
-        offset = 0
-        rsa_len = struct.unpack('>I', payload[offset:offset + 4])[0];
-        offset += 4
-        client_rsa = payload[offset:offset + rsa_len];
-        offset += rsa_len
+    def _recv_n(self, n):
+        """确保接收 n 个字节"""
+        data = b""
+        while len(data) < n:
+            packet = self.sock.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
 
-        ecdh_len = struct.unpack('>I', payload[offset:offset + 4])[0];
-        offset += 4
-        client_ecdh = payload[offset:offset + ecdh_len];
-        offset += ecdh_len
+    def handshake_initiate(self):
+        """客户端发起握手"""
+        print("[Protocol] Sending Client Hello...")
+        # 1. Client Hello (这里可以加上 LWE 加密的一小段随机数作为 Proof of Concept)
+        self.send_packet(MSG_HELLO, b"CLIENT_HELLO")
 
-        lwe_pk_raw = payload[offset:]
-        client_lwe_pk = self.lwe.deserialize_pk(lwe_pk_raw)
+        # 2. 接收 Server Key Exchange
+        m_type, payload = self.receive_packet()
+        if m_type != MSG_KEY_EXCH: raise Exception("Handshake Error")
 
-        print("[H-TLS] Server: Received keys. Computing Hybrid Secret...")
+        data = json.loads(payload.decode())
+        server_id_pub = data['id_pub'].encode()
+        server_eph_pub = data['eph_pub'].encode()
+        signature = bytes.fromhex(data['sign'])
+        salt = bytes.fromhex(data['salt'])
 
-        # 2. Server Computations
-        # A. ECDH Shared Secret
-        ecdh_secret = self.crypto.compute_ecdh_secret(client_ecdh)
-
-        # B. Lattice KEM Encapsulation (Quantum Safe Layer)
-        # Server chooses the random secret, encrypts it with Client's LWE Public Key
-        lwe_ciphertexts, lwe_secret_byte = self.lwe.encapsulate(client_lwe_pk)
-        print(f"[H-TLS] Server: Lattice Secret Generated: {lwe_secret_byte.hex()}")
-
-        # C. Derive Session Key (Hybrid)
-        # Input Key Material = ECDH_Secret || Lattice_Secret
-        ikm = ecdh_secret + lwe_secret_byte
-        self.session_key = self.crypto.hkdf_expand(ikm, b'H-TLS v1')
-
-        # 3. Send ServerHello
-        # Payload: [RSA_Pub][ECDH_Pub][LWE_Ciphertexts][Signature]
-        my_rsa = self.crypto.get_rsa_pub_bytes()
-        my_ecdh = self.crypto.get_ecdh_pub_bytes()
-        lwe_ct_bytes = self.lwe.serialize_ciphertexts(lwe_ciphertexts)
-
-        body_to_sign = (
-                struct.pack('>I', len(my_rsa)) + my_rsa +
-                struct.pack('>I', len(my_ecdh)) + my_ecdh +
-                struct.pack('>I', len(lwe_ct_bytes)) + lwe_ct_bytes
-        )
-
-        signature = self.crypto.sign(body_to_sign)  # Sign identity
-
-        full_payload = body_to_sign + struct.pack('>I', len(signature)) + signature
-        self.net.send_frame(PacketLayer.TYPE_HANDSHAKE, full_payload)
-        print("[H-TLS] Server: Handshake Complete. Secure Channel Ready.")
-
-    def handshake_as_client(self):
-        print("[H-TLS] Client: Starting Handshake...")
-
-        # 1. Prepare ClientHello
-        # Client generates LWE Keypair (Receiver)
-        lwe_pk, self.lwe_sk = self.lwe.key_gen()
-        lwe_pk_bytes = self.lwe.serialize_pk(lwe_pk)
-
-        my_rsa = self.crypto.get_rsa_pub_bytes()
-        my_ecdh = self.crypto.get_ecdh_pub_bytes()
-
-        payload = (
-                struct.pack('>I', len(my_rsa)) + my_rsa +
-                struct.pack('>I', len(my_ecdh)) + my_ecdh +
-                lwe_pk_bytes
-        )
-        self.net.send_frame(PacketLayer.TYPE_HANDSHAKE, payload)
-
-        # 2. Receive ServerHello
-        m_type, resp = self.net.recv_frame()
-
-        offset = 0
-        rsa_len = struct.unpack('>I', resp[offset:offset + 4])[0];
-        offset += 4
-        server_rsa = resp[offset:offset + rsa_len];
-        offset += rsa_len
-
-        ecdh_len = struct.unpack('>I', resp[offset:offset + 4])[0];
-        offset += 4
-        server_ecdh = resp[offset:offset + ecdh_len];
-        offset += ecdh_len
-
-        lwe_ct_len = struct.unpack('>I', resp[offset:offset + 4])[0];
-        offset += 4
-        lwe_ct_raw = resp[offset:offset + lwe_ct_len];
-        offset += lwe_ct_len
-
-        sig_len = struct.unpack('>I', resp[offset:offset + 4])[0];
-        offset += 4
-        signature = resp[offset:offset + sig_len]
-
-        # 3. Verify Signature (Integrity & Auth)
-        signed_part = resp[:offset - 4 - sig_len]
-        if not self.crypto.verify(server_rsa, signed_part, signature):
+        # 3. 验证签名 (防中间人攻击)
+        # 注：实际场景中客户端应预先知道服务器公钥，这里简化为信任首次接收的公钥
+        print("[Protocol] Verifying Server Signature...")
+        if not self.crypto.verify_signature(server_id_pub, server_eph_pub, signature):
             raise Exception("Server Signature Verification Failed!")
-        print("[H-TLS] Client: Server Identity Verified.")
 
-        # 4. Compute Secrets
-        ecdh_secret = self.crypto.compute_ecdh_secret(server_ecdh)
+        # 4. 生成自己的临时密钥并计算共享密钥
+        my_eph_pub = self.crypto.generate_ephemeral_keys()
+        self.crypto.compute_shared_secret(server_eph_pub, salt)
 
-        # Decapsulate LWE
-        lwe_ciphertexts = self.lwe.deserialize_ciphertexts(lwe_ct_raw)
-        lwe_secret_byte = self.lwe.decapsulate(self.lwe_sk, lwe_ciphertexts)
-        print(f"[H-TLS] Client: Lattice Secret Recovered: {lwe_secret_byte.hex()}")
+        # 5. 发送 Client Key Exchange
+        sign = self.crypto.sign_message(my_eph_pub)  # 对自己的临时公钥签名
+        resp = {
+            'id_pub': self.crypto.get_identity_pub_pem().decode(),
+            'eph_pub': my_eph_pub.decode(),
+            'sign': sign.hex()
+        }
+        self.send_packet(MSG_KEY_EXCH, json.dumps(resp).encode())
+        print("[Protocol] Handshake Completed. Secure Channel Established.")
 
-        ikm = ecdh_secret + lwe_secret_byte
-        self.session_key = self.crypto.hkdf_expand(ikm, b'H-TLS v1')
-        print("[H-TLS] Client: Secure Channel Ready.")
+    def handshake_respond(self):
+        """服务端响应握手"""
+        print("[Protocol] Waiting for Client Hello...")
+        m_type, payload = self.receive_packet()
+        if m_type != MSG_HELLO: return False
 
-    def send_secure(self, plaintext):
-        if not self.session_key: raise Exception("No Session Key")
-        ciphertext = self.crypto.aes_gcm_encrypt(self.session_key, plaintext.encode())
-        self.net.send_frame(PacketLayer.TYPE_DATA, ciphertext)
+        # 1. 生成临时密钥
+        my_eph_pub = self.crypto.generate_ephemeral_keys()
 
-    def recv_secure(self):
-        m_type, payload = self.net.recv_frame()
-        if m_type != PacketLayer.TYPE_DATA: return None
-        plaintext = self.crypto.aes_gcm_decrypt(self.session_key, payload)
-        return plaintext.decode()
+        # 2. 签名临时公钥
+        sign = self.crypto.sign_message(my_eph_pub)
+        salt = os.urandom(16)  # 服务器生成 Salt
+
+        # 3. 发送 Server Key Exchange
+        msg = {
+            'id_pub': self.crypto.get_identity_pub_pem().decode(),
+            'eph_pub': my_eph_pub.decode(),
+            'sign': sign.hex(),
+            'salt': salt.hex()
+        }
+        self.send_packet(MSG_KEY_EXCH, json.dumps(msg).encode())
+
+        # 4. 接收 Client Key Exchange
+        m_type, payload = self.receive_packet()
+        data = json.loads(payload.decode())
+        client_id_pub = data['id_pub'].encode()
+        client_eph_pub = data['eph_pub'].encode()
+        client_sign = bytes.fromhex(data['sign'])
+
+        # 5. 验证客户端签名
+        if not self.crypto.verify_signature(client_id_pub, client_eph_pub, client_sign):
+            raise Exception("Client Signature Verification Failed!")
+
+        # 6. 计算共享密钥
+        self.crypto.compute_shared_secret(client_eph_pub, salt)
+        print("[Protocol] Handshake Completed.")
+        return True
+
+    def send_encrypted(self, text):
+        encrypted = self.crypto.symmetric_encrypt(text.encode())
+        self.send_packet(MSG_DATA, encrypted)
+
+    def recv_decrypted(self):
+        m_type, payload = self.receive_packet()
+        if m_type == MSG_DATA:
+            try:
+                decrypted = self.crypto.symmetric_decrypt(payload)
+                return decrypted.decode()
+            except Exception as e:
+                print(f"Decryption Error: {e}")
+                return None
+        return None
