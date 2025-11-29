@@ -6,39 +6,36 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 class SecurityManager:
     def __init__(self):
-        print("[Crypto] 初始化安全模块，生成临时身份密钥...")
-        # 1. RSA 密钥对：用于“身份认证”和“数字签名”
-        # 2048位是目前的工业标准安全长度
+        # RSA 身份密钥（长期）
         self.rsa_private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048
+            public_exponent=65537, key_size=2048
         )
         self.rsa_public_key = self.rsa_private_key.public_key()
-        
-        # 2. ECDH 密钥对：用于“密钥协商”
-        # 每次会话生成新的（临时），保证前向安全性
-        self.ecdh_private_key = ec.generate_private_key(ec.SECP256R1())
-        self.ecdh_public_key = self.ecdh_private_key.public_key()
-        
-        self.session_key = None # 最终协商出来的 AES 密钥
 
-    def get_rsa_public_bytes(self):
-        """导出 RSA 公钥为 PEM 格式，以便通过网络发送"""
+        # ECDH 临时密钥（每次会话生成）
+        self.ecdh_private_key = None
+        self.ecdh_public_key = None
+        self.session_key = None
+
+    def get_identity_pub_pem(self):
+        """获取 RSA 公钥（PEM 格式）"""
         return self.rsa_public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
-    def get_ecdh_public_bytes(self):
-        """导出 ECDH 公钥为 PEM 格式"""
+    def generate_ephemeral_keys(self):
+        """生成 ECDH 临时密钥对，返回公钥（PEM 格式）"""
+        self.ecdh_private_key = ec.generate_private_key(ec.SECP256R1())
+        self.ecdh_public_key = self.ecdh_private_key.public_key()
         return self.ecdh_public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
-    def sign_data(self, data):
-        """核心功能：用我的私钥对数据签名，证明‘这是我发的’"""
-        signature = self.rsa_private_key.sign(
+    def sign_message(self, data):
+        """用 RSA 私钥签名数据"""
+        return self.rsa_private_key.sign(
             data,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
@@ -46,13 +43,12 @@ class SecurityManager:
             ),
             hashes.SHA256()
         )
-        return signature
 
-    def verify_signature(self, rsa_pub_bytes, data, signature):
-        """核心功能：用对方的公钥验签，防止中间人篡改数据"""
-        peer_rsa_pub = serialization.load_pem_public_key(rsa_pub_bytes)
+    def verify_signature(self, pub_key_pem, data, signature):
+        """用 RSA 公钥验证签名"""
+        pub_key = serialization.load_pem_public_key(pub_key_pem)
         try:
-            peer_rsa_pub.verify(
+            pub_key.verify(
                 signature,
                 data,
                 padding.PSS(
@@ -63,50 +59,37 @@ class SecurityManager:
             )
             return True
         except Exception as e:
-            print(f"[Crypto] 验签失败: {e}")
+            print(f"验签失败: {e}")
             return False
 
-    def derive_session_key(self, peer_ecdh_pub_bytes):
-        """核心功能：Diffie-Hellman 密钥协商"""
-        # 加载对方发来的 ECDH 公钥
-        peer_ecdh_pub = serialization.load_pem_public_key(peer_ecdh_pub_bytes)
-        
-        # 魔法时刻：我的私钥 + 你的公钥 = 共享密钥
-        shared_key = self.ecdh_private_key.exchange(ec.ECDH(), peer_ecdh_pub)
-        
-        # 使用 HKDF 算法将共享密钥转化为标准的 AES 256位 密钥
+    def compute_shared_secret(self, peer_ecdh_pub_pem, salt):
+        """计算 ECDH 共享密钥，派生 AES 会话密钥"""
+        peer_ecdh_pub = serialization.load_pem_public_key(peer_ecdh_pub_pem)
+        shared_secret = self.ecdh_private_key.exchange(ec.ECDH(), peer_ecdh_pub)
+
+        # HKDF 派生 32 字节 AES 密钥
         self.session_key = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=None,
+            salt=salt,
             info=b'secure_chat_handshake',
-        ).derive(shared_key)
-        print(f"[Crypto] 协商完成，AES 密钥指纹: {self.session_key.hex()[:8]}...")
+        ).derive(shared_secret)
+        print(f"[System] 会话密钥协商成功 (Hex): {self.session_key.hex()[:10]}...")
 
-    def encrypt_message(self, plaintext):
-        """AES-GCM 加密：同时提供加密和防篡改校验"""
+    def symmetric_encrypt(self, plaintext_bytes):
+        """AES-GCM 加密（返回 Nonce + 密文）"""
         if not self.session_key:
-            raise Exception("错误：未建立安全连接")
-        
-        # 这里的 Nonce (随机数) 是防止重放攻击的关键
-        nonce = os.urandom(12)
+            raise Exception("会话密钥未建立")
+        nonce = os.urandom(12)  # 12 字节 Nonce（AES-GCM 推荐）
         aesgcm = AESGCM(self.session_key)
-        ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
-        
-        # 将 Nonce 拼在密文前面一起发过去，解密时需要用到
-        return nonce + ciphertext
+        ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
+        return nonce + ciphertext  # 前 12 字节是 Nonce，后面是密文
 
-    def decrypt_message(self, payload):
-        """AES-GCM 解密"""
+    def symmetric_decrypt(self, ciphertext_with_nonce):
+        """AES-GCM 解密（输入 Nonce + 密文）"""
         if not self.session_key:
-            raise Exception("错误：未建立安全连接")
-        
-        nonce = payload[:12] # 取出前12字节的随机数
-        ciphertext = payload[12:]
-        
+            raise Exception("会话密钥未建立")
+        nonce = ciphertext_with_nonce[:12]
+        ciphertext = ciphertext_with_nonce[12:]
         aesgcm = AESGCM(self.session_key)
-        try:
-            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-            return plaintext.decode('utf-8')
-        except Exception:
-            return "[解密失败：数据损坏或密钥错误]"
+        return aesgcm.decrypt(nonce, ciphertext, None)
